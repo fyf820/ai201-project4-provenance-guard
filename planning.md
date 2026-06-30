@@ -124,7 +124,7 @@ Human Reviewer Queue
     v
 Human Reviewer
     |
-    | approve / deny verified-human credential
+    | POST /verify-human/approve after reviewing evidence
     v
 Audit Logger
     |
@@ -163,28 +163,88 @@ Platform UI
 
 The attribution pipeline uses three distinct signals so the final decision does not depend on any single heuristic.
 
-### 1. LLM-based classification - 45%
+The reason for using an ensemble is the false-positive risk. A single detector can confuse style with authorship: a formal human essay can look AI-like, and a lightly edited AI draft can look human-like. The three signals were chosen because they observe different properties of the same text:
+
+- LLM-based classification captures semantic and stylistic judgment across the whole passage.
+- Stylometric heuristics measure structural writing patterns directly in Python.
+- Repetition / redundancy checks whether the text reuses phrases or boilerplate in ways common to generated text.
+
+Together, these signals make the system more transparent than a single black-box score. The API can show which signals contributed to a result, and the audit log preserves those scores for appeals.
+
+### 1. LLM-based classification - 50%
 - What it measures: overall semantic coherence, voice consistency, and whether the text feels human-written, AI-generated, or uncertain.
 - Output: a score from `0.0` to `1.0` representing AI-likelihood.
   - `0.0` means strongly human.
   - `1.0` means strongly AI-generated.
-- Why this signal matters: it captures the broadest, most holistic view of the writing.
+- Why this signal matters: it captures the broadest, most holistic view of the writing. It can notice semantic flow, voice, and contextual cues that simple statistics cannot. It gets the highest weight because it is the most flexible signal, but it is not trusted alone because model judgments can be overconfident or inconsistent.
+- What it misses: it may be wrong on niche styles, short passages, satire, non-native English writing, or text that intentionally imitates AI-like formality.
 
-### 2. Stylometric heuristics - 30%
+### 2. Stylometric heuristics - 25%
 - What it measures: sentence-length variance, type-token ratio, punctuation density, repetition rate, and average sentence complexity.
 - Output: a score from `0.0` to `1.0` representing AI-likelihood.
-- Why this signal matters: it captures structural writing patterns that are hard to see from semantic analysis alone.
+- Implementation:
+  - The detector lowercases the text and extracts words using a simple word regex.
+  - It splits the text into sentences and counts the number of words in each sentence.
+  - It computes sentence-length variance. Lower variance increases `regularity_score` because highly uniform sentence structure can look machine-like.
+  - It computes type-token ratio, which is the number of unique words divided by total words. Lower vocabulary variety increases `diversity_score`.
+  - It computes repeated-word ratio, punctuation density, and first-person pronoun ratio.
+  - It counts generic AI-style phrases such as `it is important to note`, `transformative paradigm shift`, `ethical implications`, `responsible deployment`, `comprehensive`, `scalable`, and `future iterations`.
+  - It computes `polished_formality_score` when the text has longer sentences, little or no first-person voice, high type-token ratio, and low punctuation density.
+- Internal metric meanings:
+  - `regularity_score`: higher when sentence lengths are unusually uniform.
+  - `diversity_score`: higher when vocabulary diversity is lower.
+  - `repetition_score`: higher when words repeat more often.
+  - `punctuation_score`: higher when punctuation density is high.
+  - `generic_phrase_score`: higher when the text contains known polished AI-style phrases.
+  - `first_person_inverse`: higher when the text has little personal voice.
+  - `polished_formality_score`: higher when the text is formal, smooth, and impersonal.
+- AI-likelihood is computed as:
+
+  `ai_likelihood = (`
+  `    0.18 * regularity_score`
+  `    + 0.15 * diversity_score`
+  `    + 0.12 * repetition_score`
+  `    + 0.08 * punctuation_score`
+  `    + 0.27 * generic_phrase_score`
+  `    + 0.10 * first_person_inverse`
+  `    + 0.10 * polished_formality_score`
+  `)`
+
+- Why this signal matters: it captures structural writing patterns that are hard to see from semantic analysis alone. It is especially useful for separating casual, irregular writing from polished, generic, impersonal writing. It is kept as a supporting signal because some human writing, such as academic work or formal essays, can also be polished and impersonal. This signal helps explain the decision with measurable evidence rather than only a model opinion.
+- What it misses: it cannot know authorship; it only measures style. Human poetry, formal essays, technical writing, and simple vocabulary may be scored as more AI-like than they really are.
 
 ### 3. Repetition / redundancy signal - 25%
 - What it measures: repeated phrases, near-duplicate sentences, n-gram reuse, and overly uniform phrasing.
 - Output: a score from `0.0` to `1.0` representing AI-likelihood.
-- Why this signal matters: it detects internal pattern reuse that often appears in generated text.
+- Implementation:
+  - The detector normalizes sentences by lowercasing them and keeping only word tokens.
+  - It computes `sentence_duplication_score` from the ratio of repeated normalized sentences.
+  - It builds 2-grams and 3-grams from the text and computes how often those short phrases repeat.
+  - It computes `structural_redundancy_score` by boosting repeated n-gram reuse, because near-duplicate AI sentences often repeat phrase shapes without being exact sentence copies.
+  - It computes `immediate_repeat_ratio` for back-to-back repeated words.
+  - It reuses the generic AI phrase list to compute `boilerplate_score`, which captures repeated or formulaic AI-style language even when the exact sentences are not duplicated.
+- Internal metric meanings:
+  - `sentence_duplication_score`: higher when full normalized sentences repeat.
+  - `repeated_ngram_score`: higher when 2-word or 3-word phrases recur.
+  - `structural_redundancy_score`: a stronger version of n-gram repetition used to catch near-duplicate sentence structure.
+  - `boilerplate_score`: higher when the text contains generic AI-style wording.
+  - `immediate_repeat_ratio`: higher when the same word appears back-to-back.
+- AI-likelihood is computed by taking the strongest redundancy cue:
+
+  `ai_likelihood = max(sentence_duplication_score, structural_redundancy_score, boilerplate_score * 0.75, immediate_repeat_ratio)`
+
+- Why this signal matters: it detects internal pattern reuse that often appears in generated text. The detector uses `max(...)` instead of averaging because a single strong redundancy pattern should be visible rather than diluted by the other metrics. This makes it more useful as an independent check alongside the LLM and stylometric signals. It is also easy to audit: a reviewer can inspect repeated n-grams, duplicated sentences, and boilerplate phrases.
+- What it misses: high-quality AI text may avoid repetition, while human creative writing may intentionally repeat words for rhythm, emphasis, or style.
 
 ### Combining the signals
 
 Each signal returns a continuous score rather than a binary flag. The raw signal outputs are first normalized onto the same `0.0` to `1.0` AI-likelihood scale, then combined as a weighted average:
 
-`ensemble_ai_score = (0.45 * llm_score) + (0.30 * stylometric_score) + (0.25 * repetition_score)`
+`ensemble_ai_score = (0.50 * llm_score) + (0.25 * stylometric_score) + (0.25 * repetition_score)`
+
+The LLM signal receives the highest weight because it captures semantic meaning, voice, and overall authorship impression across the whole submission. Stylometric and repetition signals are weighted evenly as supporting checks because they measure concrete text properties, but either one can produce false positives for certain human writing styles such as poetry, formal essays, or intentionally repetitive creative work.
+
+If this were deployed for real, I would tune these weights against a labeled validation set from the actual platform rather than hand-picked examples. I would also calibrate scores separately for genre, length, and language background, because poems, academic writing, fan posts, and non-native English writing do not share the same style distribution.
 
 ## Uncertainty representation
 
@@ -204,6 +264,8 @@ Thresholds:
 - `0.65 to 1.00` of `ensemble_ai_score` -> likely AI
 
 This design makes borderline cases visible instead of forcing a false binary answer. A score near `0.51` should surface as uncertain, while a score near `0.95` should produce a strong label.
+
+This confidence score is intentionally not presented as proof of authorship. It is the system's certainty about its own classification based on the available signals. In a production deployment, I would improve this with calibration tests, such as reliability curves or threshold analysis on labeled examples, to check whether `0.80` confidence is actually correct around 80% of the time. I would also keep the uncertain band wide until the system has enough real-world validation data, because false positives against human creators are more harmful than leaving some cases unresolved.
 
 ## Transparency label
 
@@ -314,21 +376,35 @@ Creators can earn a verified-human credential through an additional human review
 - Stores the request in the audit log alongside the original content and attribution result.
 - Does not automatically change the attribution label unless the reviewer approves the credential.
 - Only updates the verified-human credential if a human reviewer approves the request after review.
+- Accepts `POST /verify-human/approve` from a reviewer to approve a pending request.
+- When approved, stores `credential_status: approved`, `badge_text: Verified human`, and `display_badge: true`.
 
 ### How it is displayed on content
 - Approved content shows a visible badge such as `Verified human` or `Verified human by review`.
 - The badge should appear near the transparency label so readers can distinguish platform verification from the AI detection result.
 - The badge only indicates that a human reviewer confirmed the creator's provenance claim; it does not replace the attribution label.
 
+Approved credential response example:
+
+```json
+{
+  "credential_status": "approved",
+  "badge_text": "Verified human",
+  "display_badge": true,
+  "standard_transparency_label": "Likely human-written. This post appears to have been written by a person. Confidence: 81%"
+}
+```
+
 ### Verification flow
 
-`POST /verify-human` -> `human review` -> `audit log` -> `credential response`
+`POST /verify-human` -> `human review queue` -> `POST /verify-human/approve` -> `audit log` -> `credential response`
 
 Arrow labels:
 - `POST /verify-human`: content ID, creator reasoning, and optional supporting context
-- `human review`: reviewer checks the submission and provenance claim
+- `human review queue`: reviewer checks the submission and provenance claim
+- `POST /verify-human/approve`: reviewer ID and optional review notes
 - `audit log`: verification request, reviewer decision, and credential status are recorded
-- `credential response`: approved or denied response, plus the visible badge state
+- `credential response`: approved response, plus the visible badge state
 
 ## Analytics dashboard
 
@@ -350,6 +426,20 @@ The dashboard will present a simple operational view of how the system is behavi
 - Each metric should be visible as a simple count, percentage, or ratio.
 - The dashboard should use audit log data so the numbers reflect the same events stored for submissions and appeals.
 - The view should be lightweight and easy to scan, not a full analytics suite.
+
+## Rate limiting
+
+The `/submit` endpoint uses Flask-Limiter with this limit:
+
+`10 submissions per minute; 100 submissions per day per client IP`
+
+I chose `10 per minute` because it reflects realistic creator behavior while preventing simple automated flooding. A writer manually submitting their own work is unlikely to submit more than 10 separate pieces in one minute, but the limit still allows demos, retries, and quick testing without feeling too strict.
+
+I chose `100 per day` as a longer-term abuse guard. A creator may reasonably submit several poems, blog posts, or draft revisions in one day, but 100 attribution requests from one client IP is already higher than normal individual usage. This protects the Groq-backed detector from automated use while keeping the class demo generous.
+
+I considered a stricter burst rule like `1 request every 3 seconds`, but that would be frustrating for testing and for platform clients that submit a few queued posts at once. `10 per minute` is a better project default: easy to explain, permissive for humans, and still useful against scripts.
+
+When tested with 12 rapid requests, the first 10 requests returned `201 Created` and requests 11 and 12 returned `429`, confirming that the per-minute limiter blocks requests over the configured quota.
 
 ## Anticipated edge cases
 
